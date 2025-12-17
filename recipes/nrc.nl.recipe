@@ -1,11 +1,12 @@
-#!/usr/bin/env  python
+#!/usr/bin/env python
 import datetime
 import json
 import re
+import os
+import hashlib
 from contextlib import closing
 
 from mechanize import Request
-
 from calibre.web.feeds.recipes import BasicNewsRecipe
 
 
@@ -19,36 +20,14 @@ class NRC(BasicNewsRecipe):
     country = 'NL'
     category = 'news, politics, Netherlands'
     resolve_internal_links = True
-    remove_tags_before = {'class': 'article__header-and-content'}
-    remove_tags_after = {'class': 'article__header-and-content'}
-    remove_tags = [
-        dict(
-            attrs={
-                'class': [
-                    'article__footer',
-                    'lees-ook',
-                    'luister-naar',
-                    'print-layout-warning',
-                    'newslettersignup',
-                    'article__byline',
-                    'article__published-in',
-                    'article__featured-image__caption__producer',
-                    'metabox',
-                ]
-            }
-        ),
-        dict(name=['script', 'noscript', 'style']),
-    ]
-    remove_attributes = ['class', 'id', 'name', 'style']
+
     encoding = 'utf-8'
     no_stylesheets = True
     ignore_duplicate_articles = {'url'}
     delay = 0.3
-
     touchscreen = True
 
     frontpage = None
-
     title_regexp = None
 
     @staticmethod
@@ -59,9 +38,7 @@ class NRC(BasicNewsRecipe):
         if not title:
             return title
         if self.title_regexp is None:
-            self.title_regexp = re.compile(
-                r'<span class="keyword">([^<]+)</span>\s*'
-            )
+            self.title_regexp = re.compile(r'<span class="keyword">([^<]+)</span>\s*')
         return self.title_regexp.sub(r'\1 ', title)
 
     def parse_index(self):
@@ -75,63 +52,277 @@ class NRC(BasicNewsRecipe):
         monthly_list_urls = [
             self._monthly_list_url(today),
             self._monthly_list_url(
-                datetime.date(today.year, today.month, 1) -
-                datetime.timedelta(days=1)
+                datetime.date(today.year, today.month, 1) - datetime.timedelta(days=1)
             )
         ]
         issue_url = None
-        issue_date = None
+
         for monthly_list_url in monthly_list_urls:
-            with closing(
-                self.browser.open(Request(monthly_list_url, None, headers))
-            ) as r:
+            with closing(self.browser.open(Request(monthly_list_url, None, headers))) as r:
                 issues = json.loads(r.read())
-                if len(issues) > 0:
+                if issues:
                     issue_date = datetime.datetime.strptime(
                         issues[0]['published_at'], '%Y-%m-%dT%H:%M:%SZ'
                     )
                     issue_url = self._monthly_list_url(issue_date, '%Y/%m/%d/')
-                    self.frontpage = issues[0]['frontpage']
+                    self.frontpage = issues[0].get('frontpage')
                     break
+
         if issue_url is None:
             return []
+
         with closing(self.browser.open(Request(issue_url, None, headers))) as r:
             edition = json.loads(r.read())
+
         documents = {}
-        for headline in edition['paperheadlines']:
-            item = headline['item']
-            documents[headline['document_id']] = dict(
-                url=item['full_url'],
-                headline=self._clean_article_title(item['headline'])
+        for headline in edition.get('paperheadlines', []):
+            item = headline.get('item', {})
+            doc_id = headline.get('document_id')
+            if not doc_id:
+                continue
+            documents[doc_id] = dict(
+                url=item.get('full_url'),
+                headline=self._clean_article_title(item.get('headline', ''))
             )
-        for section in edition['sections']:
+
+        for section in edition.get('sections', []):
             articles = []
-            for doc in section['document_ids']:
+            for doc in section.get('document_ids', []):
                 if doc not in documents:
-                    self.log.warn('Document not found:', doc)
                     continue
-                articles.append(
-                    dict(
-                        title=documents[doc]['headline'], url=documents[doc]['url']
-                    )
-                )
-            sections.append((section['name'], articles))
+                if documents[doc].get('url'):
+                    articles.append(dict(title=documents[doc]['headline'], url=documents[doc]['url']))
+            sections.append((section.get('name', 'NRC'), articles))
+
         return sections
 
     def preprocess_html(self, soup):
-        for tag in soup():
-            if tag.name == 'img':
-                if tag.has_attr('data-src-medium'):
-                    tag['src'] = tag['data-src-medium'].split('|')[0]
-                elif tag.has_attr('data-src'):
-                    tag['src'] = tag['data-src'].split('|')[0]
-                if tag['src'].startswith('//'):
-                    tag['src'] = 'https:' + tag['src']
-                elif tag['src'].startswith('/'):
-                    tag['src'] = 'https://www.nrc.nl' + tag['src']
+        for img in soup.find_all('img'):
+            if img.has_attr('data-src-medium'):
+                img['src'] = img['data-src-medium'].split('|')[0]
+            elif img.has_attr('data-src'):
+                img['src'] = img['data-src'].split('|')[0]
+            if img.has_attr('src'):
+                if img['src'].startswith('//'):
+                    img['src'] = 'https:' + img['src']
+                elif img['src'].startswith('/'):
+                    img['src'] = 'https://www.nrc.nl' + img['src']
+
         if self.browser.cookiejar:
             self.browser.cookiejar.clear()
         return soup
 
+    def _first_text(self, tag):
+        if not tag:
+            return None
+        txt = ' '.join(tag.stripped_strings)
+        return txt.strip() if txt else None
+    
+    def _extract_featured_image(self, root):
+        """
+        Extract the featured/header image + caption/credit.
+        NRC puts the featured image in the article header (.dmt-header__image),
+        while the body may contain placeholders with <img> lacking src.
+        """
+        if not root:
+            return (None, None, None, None, None)
+
+        block = (
+            root.select_one('.dmt-header__image .article-media--image') or
+            root.select_one('header .article-media--image') or
+            root.select_one('.article-media--image')
+        )
+        if not block:
+            return (None, None, None, None, None)
+
+        img = block.find('img')
+        src = img.get('src') if img else None
+        alt = img.get('alt') if img else None
+        # Ignore placeholders that have no usable src
+        if not src:
+            return (block, None, alt, None, None)
+
+        cap = block.select_one('figcaption .caption') or block.select_one('figcaption p.caption')
+        cred = block.select_one('figcaption .credit') or block.select_one('figcaption small.credit')
+        return (block, src, alt, self._first_text(cap), self._first_text(cred))
+
+
+    def postprocess_html(self, soup, *args, **kwargs):
+        from bs4 import NavigableString  # calibre ships bs4
+        
+        lead_image_url = lead_image_alt = lead_caption = lead_credit = None
+
+        # Extract title
+        title_text = None
+        h1 = soup.find('h1', class_='dmt-headline__title')
+        title_text = self._first_text(h1)
+        if not title_text:
+            og = soup.find('meta', attrs={'property': 'og:title'})
+            if og and og.get('content'):
+                title_text = og['content'].strip()
+
+        # Extract author
+        author_text = None
+        author_el = soup.select_one('.dmt-byline__author-name')
+        author_text = self._first_text(author_el)
+        if not author_text:
+            # Fallback: JSON-LD
+            for s in soup.find_all('script', attrs={'type': 'application/ld+json'}):
+                try:
+                    data = json.loads((s.string or '').strip() or '{}')
+                    auth = data.get('author')
+                    if isinstance(auth, list) and auth and isinstance(auth[0], dict):
+                        author_text = auth[0].get('name')
+                        break
+                except Exception:
+                    continue
+
+        # Extract publication date
+        date_text = None
+        t = soup.find('time', class_='dmt-byline__publication-date')
+        date_text = self._first_text(t)
+        if not date_text:
+            # Fallback: JSON-LD ISO date -> keep YYYY-MM-DD if needed
+            for s in soup.find_all('script', attrs={'type': 'application/ld+json'}):
+                try:
+                    data = json.loads((s.string or '').strip() or '{}')
+                    iso = data.get('datePublished')
+                    if iso:
+                        date_text = iso.split('T', 1)[0]
+                        break
+                except Exception:
+                    continue
+                
+        # Extract featured/header image
+        header_block, src, alt, cap, cred = self._extract_featured_image(soup)
+        if src:
+            lead_image_url = src
+            lead_image_alt = alt
+            lead_caption = cap
+            lead_credit = cred
+
+
+        # Extract article body container
+        content = soup.select_one('.googlebot-article-content')
+        if not content:
+            art = soup.find('article')
+            if art:
+                content = art
+
+        if content:
+            if not lead_image_url:
+                for cand in content.select('.article-media--image'):
+                    img = cand.find('img')
+                    src = img.get('src') if img else None
+                    if not src:
+                        continue
+                    lead_image_url = src
+                    lead_image_alt = img.get('alt') if img else None
+                    cap = cand.select_one('figcaption .caption') or cand.select_one('figcaption p.caption')
+                    cred = cand.select_one('figcaption .credit') or cand.select_one('figcaption small.credit')
+                    lead_caption = self._first_text(cap)
+                    lead_credit = self._first_text(cred)
+                    cand.decompose()
+                    break
+            
+
+            # Remove videos and other bloat inside the content area
+            for bad in content.select(
+                '.article-media--video, '
+                '.dmt-article-suggestion, '
+                '.dmt-callout, '
+                'dmt-util-bar, dmt-audioplayer, '
+                'dialog, nav, header, footer, aside, '
+                '.banner, .paywall'
+            ):
+                bad.decompose()
+
+            for bad in content.find_all(['video', 'iframe', 'source', 'script', 'noscript', 'style']):
+                bad.decompose()
+
+            # Remove remaining images (we only keep the extracted lead image)
+            for img in content.find_all('img'):
+                img.decompose()
+
+            # Drop empty paragraphs
+            for p in content.find_all('p'):
+                if not p.get_text(strip=True) and not p.find(['br']):
+                    p.decompose()
+
+            # Detach content so we can rebuild a minimal document
+            content = content.extract()
+
+        # Rebuild minimal HTML
+        soup.clear()
+        html = soup.new_tag('html')
+        body = soup.new_tag('body')
+        html.append(body)
+        soup.append(html)
+
+        if title_text:
+            h = soup.new_tag('h1')
+            h.string = title_text
+            body.append(h)
+
+        if author_text or date_text:
+            meta = soup.new_tag('p')
+            parts = []
+            if author_text:
+                parts.append(author_text)
+            if date_text:
+                parts.append(date_text)
+            meta.string = ' — '.join(parts)
+            body.append(meta)
+            
+        # Insert lead image + caption/credit
+        if lead_image_url:
+            fig = soup.new_tag('figure')
+            im = soup.new_tag('img')
+            im['src'] = lead_image_url
+            if lead_image_alt:
+                im['alt'] = lead_image_alt
+            fig.append(im)
+
+            if lead_caption or lead_credit:
+                # Render caption + credit in the same (small) font, separated by " — "
+                fc = soup.new_tag('figcaption')
+                sm = soup.new_tag('small')
+                if lead_caption and lead_credit:
+                    sm.string = f'{lead_caption} — {lead_credit}'
+                elif lead_caption:
+                    sm.string = lead_caption
+                else:
+                    sm.string = lead_credit
+                fc.append(sm)
+                fig.append(fc)
+            body.append(fig)
+            
+
+        if content:
+            # Keep only readable content tags (p/h2/etc.), discard stray whitespace nodes
+            for child in list(content.contents):
+                if isinstance(child, NavigableString) and not child.strip():
+                    continue
+                body.append(child)
+
+        # Final safety: strip remaining attributes to avoid leftover bloat
+        for tag in soup.find_all(True):
+            # Keep only what we explicitly allow.
+            allowed = set()
+            if tag.name == 'img':
+                allowed = {'src', 'alt'}
+            # (Intentionally keep links attribute-free for maximal cleanliness.)
+            for attr in list(tag.attrs.keys()):
+                if attr not in allowed:
+                    del tag.attrs[attr]
+
+        return soup
+
     def get_cover_url(self):
         return self.frontpage
+
+
+calibre_most_common_ua = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+)
